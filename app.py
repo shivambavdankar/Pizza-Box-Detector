@@ -6,6 +6,8 @@ from dotenv import load_dotenv, find_dotenv
 import gradio as gr
 import tempfile
 import uuid
+import csv, json
+from datetime import datetime
 
 
 # -------- config & env --------
@@ -142,26 +144,126 @@ def draw_detections(image: Image.Image, rf_json: dict, ui_conf: float):
     img.save(tmp_path, format="PNG")
     return img, df, summary, tmp_path
 
+# ===== Heuristic agent helpers: 1-step adaptive retry + CSV logging =====
+
+# Where the CSV log will be written
+LOG_CSV_PATH = os.path.join(os.path.dirname(__file__), "pizza_runs_log.csv")
+
+def _filtered_count(rf_json: dict, ui_conf: float) -> int:
+    preds = rf_json.get("predictions", []) if isinstance(rf_json, dict) else []
+    return sum(1 for p in preds if float(p.get("confidence", p.get("score", 0.0))) >= ui_conf)
+
+def _per_class_map(df: pd.DataFrame) -> dict:
+    try:
+        return df["label"].value_counts().to_dict()
+    except Exception:
+        return {}
+
+def log_run(*, image_name: str|None, server_conf_initial: float, server_conf_used: float,
+            ui_conf: float, retried: bool, http_status: int, total_count: int,
+            per_class: dict, error: str|None):
+    """Append one row to a CSV log (auto-creates header on first write)."""
+    os.makedirs(os.path.dirname(LOG_CSV_PATH), exist_ok=True)
+    row = {
+        "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds"),
+        "image_name": image_name or "",
+        "server_conf_initial": round(server_conf_initial, 4),
+        "server_conf_used": round(server_conf_used, 4),
+        "ui_conf": round(ui_conf, 4),
+        "retried": bool(retried),
+        "http_status": int(http_status),
+        "total_count": int(total_count),
+        "per_class_json": json.dumps(per_class, ensure_ascii=False),
+        "error": error or ""
+    }
+    write_header = not os.path.exists(LOG_CSV_PATH)
+    with open(LOG_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+
+def adaptive_detect_once(pil_image: Image.Image, first_conf: float, ui_conf: float,
+                         overlap: float = 0.45, step: float = 0.05, min_conf: float = 0.05):
+    """
+    Try at first_conf; if zero detections after UI filter, retry once at (first_conf - step), floored at min_conf.
+    Returns: (rf_json, http_status, used_conf, retried_flag)
+    """
+    # pass 1
+    rf1, st1 = roboflow_detect(pil_image, server_conf=first_conf, overlap=overlap)
+    cnt1 = _filtered_count(rf1 if st1 == 200 else {}, ui_conf=ui_conf)
+    if st1 == 200 and cnt1 > 0:
+        return rf1, st1, first_conf, False
+
+    # pass 2 (lower by 5%)
+    lower = max(min_conf, round(first_conf - step, 4))
+    rf2, st2 = roboflow_detect(pil_image, server_conf=lower, overlap=overlap)
+    return rf2, st2, lower, True
+# =======================================================================
+
+
+
 # -------- gradio callback --------
 def infer(image: Image.Image, server_conf: float, ui_conf: float):
+    """
+    Heuristic agent:
+      1) run detect at server_conf
+      2) if zero detections (post UI filter), retry once at server_conf - 0.05
+      3) draw results and log every run to CSV
+    """
     if image is None:
         return None, pd.DataFrame([{"message": "Upload an image."}]), "Total detections: 0", None
 
-    # preprocess (rotate/downsize) to avoid timeouts and box misalignment
+    # Preprocess (rotate/downsize) to avoid timeouts and misalignment
     prep = _preprocess_image(image)
 
-    rf_resp, status = roboflow_detect(prep, server_conf=server_conf)
+    # Adaptive retry once if needed
+    rf_resp, status, used_conf, retried = adaptive_detect_once(
+        prep, first_conf=server_conf, ui_conf=ui_conf, overlap=0.45, step=0.05, min_conf=0.05
+    )
 
-    # surface API errors in the UI
+    # Handle HTTP errors
     if status != 200:
         msg = f"API error (HTTP {status}). "
         if isinstance(rf_resp, dict):
             if "error" in rf_resp: msg += str(rf_resp["error"])
             if "_raw" in rf_resp:  msg += " | " + rf_resp["_raw"][:200]
+        # Log error run
+        log_run(
+            image_name=getattr(image, "name", None),
+            server_conf_initial=server_conf,
+            server_conf_used=used_conf,
+            ui_conf=ui_conf,
+            retried=retried,
+            http_status=status,
+            total_count=0,
+            per_class={},
+            error=msg
+        )
         return image, pd.DataFrame([{"error": msg}]), msg, None
 
+    # Draw detections (your existing renderer applies the UI filter)
     annotated, df, summary, downloadable = draw_detections(prep, rf_resp, ui_conf=ui_conf)
+
+    total = len(df)
+    per_cls = _per_class_map(df)
+    summary = f"{summary}  |  conf_used={used_conf:.2f}{' (auto-retry)' if retried else ''}"
+
+    # Log success run
+    log_run(
+        image_name=getattr(image, "name", None),
+        server_conf_initial=server_conf,
+        server_conf_used=used_conf,
+        ui_conf=ui_conf,
+        retried=retried,
+        http_status=status,
+        total_count=total,
+        per_class=per_cls,
+        error=None
+    )
+
     return annotated, df, summary, downloadable
+
 
 # -------- UI --------
 with gr.Blocks(title="Pizza Box Detector — Roboflow API") as demo:
