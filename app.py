@@ -610,30 +610,23 @@ with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
 
         # --- Chat (LLM parses your instruction) ---
         with gr.Tab("Chat"):
-            gr.Markdown("Type natural commands like: *run agent at server 0.2 on https://…* (OpenAI if configured; regex fallback otherwise).")
-            chatbox = gr.Chatbot(height=320, label="Chat Agent")
+            gr.Markdown("Type natural commands like: *run agent at server 0.2 on https://…*")
+            chatbox = gr.Chatbot(height=320, label="Chat Agent")  # no type
             chat_msg = gr.Textbox(placeholder="e.g., run agent ui=0.3 on https://example.com/products", label="Message")
             chat_btn = gr.Button("Send")
             chat_gallery = gr.Gallery(label="Annotated images", columns=2, height=400)
             chat_zip = gr.File(label="Download all annotated (zip)")
 
-            def _append_msg(messages, role, content):
-                messages = list(messages or [])
-                messages.append({"role": role, "content": str(content or "")})
-                return messages
-
-            def chat_handler(messages, msg):
+            def chat_handler(history, msg):
                 try:
                     user_text = (msg or "").strip()
-                    messages = list(messages or [])
-
+                    history = list(history or [])
                     if not user_text:
-                        messages = _append_msg(messages, "assistant",
-                            "Please type a command (e.g., 'run agent on https://...').")
-                        return messages, [], None
+                        history.append(("", "Please type a command (e.g., 'run agent on https://...')."))
+                        return history, [], None
 
-                    # record the user's message
-                    messages = _append_msg(messages, "user", user_text)
+                    # show user message
+                    history.append((user_text, ""))
 
                     intent = _llm_parse_freeform(user_text)
                     if (intent.get("cmd") or "help") != "agent":
@@ -642,14 +635,13 @@ with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
                             "Example: 'run agent at server 0.2 on "
                             "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ef/Pizza_box.jpg/640px-Pizza_box.jpg'"
                         )
-                        messages = _append_msg(messages, "assistant", help_text)
-                        return messages, [], None
+                        history[-1] = (user_text, help_text)
+                        return history, [], None
 
                     url = (intent.get("url") or "").strip()
                     if not url:
-                        messages = _append_msg(messages, "assistant",
-                                            "Please include a URL (Google Doc or webpage).")
-                        return messages, [], None
+                        history[-1] = (user_text, "Please include a URL (Google Doc or webpage).")
+                        return history, [], None
 
                     sc = intent.get("server_conf")
                     uc = intent.get("ui_conf")
@@ -658,9 +650,8 @@ with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
 
                     result, imgs, zpath = run_agent_from_url(url, server_conf=sc, ui_conf=uc)
                     if not result.get("ok"):
-                        messages = _append_msg(messages, "assistant",
-                                            f"Failed: {result.get('message','unknown error')}")
-                        return messages, [], None
+                        history[-1] = (user_text, f"Failed: {result.get('message','unknown error')}")
+                        return history, [], None
 
                     items = result.get("items", [])
                     processed = result.get("images_processed", 0)
@@ -668,13 +659,15 @@ with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
                     reply = (f"Processed {processed} image(s) at server_conf={sc:.2f}, ui_conf={uc:.2f}.\n"
                             f"Items: {brief}{'...' if len(brief)==1200 else ''}")
 
-                    messages = _append_msg(messages, "assistant", reply)
-                    return messages, imgs, zpath
+                    history[-1] = (user_text, reply)
+                    return history, imgs, zpath
 
                 except Exception as e:
                     import traceback; traceback.print_exc()
-                    messages = _append_msg(messages or [], "assistant", f"Unexpected error: {e}")
-                    return messages, [], None
+                    history.append(("", f"Unexpected error: {e}"))
+                    return history, [], None
+
+
 
 
             chat_btn.click(chat_handler, inputs=[chatbox, chat_msg], outputs=[chatbox, chat_gallery, chat_zip])
