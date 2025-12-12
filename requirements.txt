@@ -1,5 +1,5 @@
-huggingface_hub==0.16.4
 gradio==4.44.0
+huggingface_hub>=0.19.3
 requests>=2.32
 Pillow>=10.3
 pandas>=2.2
