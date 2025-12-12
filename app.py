@@ -611,33 +611,71 @@ with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
         # --- Chat (LLM parses your instruction) ---
         with gr.Tab("Chat"):
             gr.Markdown("Type natural commands like: *run agent at server 0.2 on https://…* (OpenAI if configured; regex fallback otherwise).")
-            chatbox = gr.Chatbot(height=320, label="Chat Agent")
+            chatbox = gr.Chatbot(type="messages", height=320, label="Chat Agent")
             chat_msg = gr.Textbox(placeholder="e.g., run agent ui=0.3 on https://example.com/products", label="Message")
             chat_btn = gr.Button("Send")
             chat_gallery = gr.Gallery(label="Annotated images", columns=2, height=400)
             chat_zip = gr.File(label="Download all annotated (zip)")
 
-            def chat_handler(history, msg):
-                intent = _llm_parse_freeform(msg or "")
-                if (intent.get("cmd") or "help") != "agent":
-                    reply = ("I can fetch images from a Google Doc or webpage and run detection.\n"
-                             "Example: 'run agent at server 0.2 on https://docs.google.com/document/d/...'")
-                    return history + [(msg, reply)], [], None
+            def _append_msg(messages, role, content):
+                messages = list(messages or [])
+                messages.append({"role": role, "content": str(content or "")})
+                return messages
 
-                url = intent.get("url")
-                if not url:
-                    return history + [(msg, "Please include a URL (Google Doc or webpage).")], [], None
+            def chat_handler(messages, msg):
+                try:
+                    user_text = (msg or "").strip()
+                    messages = list(messages or [])
 
-                sc = intent.get("server_conf") if intent.get("server_conf") is not None else 0.15
-                uc = intent.get("ui_conf")     if intent.get("ui_conf")     is not None else 0.15
+                    if not user_text:
+                        messages = _append_msg(messages, "assistant",
+                            "Please type a command (e.g., 'run agent on https://...').")
+                        return messages, [], None
 
-                result, imgs, zpath = run_agent_from_url(url, server_conf=sc, ui_conf=uc)
-                if not result.get("ok"):
-                    return history + [(msg, f"Failed: {result.get('message','unknown error')}")], [], None
+                    # record the user's message
+                    messages = _append_msg(messages, "user", user_text)
 
-                reply = (f"Processed {result.get('images_processed',0)} image(s).\n"
-                         f"Items: {json.dumps(result.get('items', []), ensure_ascii=False)[:1200]}...")
-                return history + [(msg, reply)], imgs, zpath
+                    intent = _llm_parse_freeform(user_text)
+                    if (intent.get("cmd") or "help") != "agent":
+                        help_text = (
+                            "I can fetch images from a Google Doc or webpage and run detection.\n"
+                            "Example: 'run agent at server 0.2 on "
+                            "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ef/Pizza_box.jpg/640px-Pizza_box.jpg'"
+                        )
+                        messages = _append_msg(messages, "assistant", help_text)
+                        return messages, [], None
+
+                    url = (intent.get("url") or "").strip()
+                    if not url:
+                        messages = _append_msg(messages, "assistant",
+                                            "Please include a URL (Google Doc or webpage).")
+                        return messages, [], None
+
+                    sc = intent.get("server_conf")
+                    uc = intent.get("ui_conf")
+                    sc = sc if isinstance(sc, (int, float)) and 0.0 <= sc <= 1.0 else 0.15
+                    uc = uc if isinstance(uc, (int, float)) and 0.0 <= uc <= 1.0 else 0.15
+
+                    result, imgs, zpath = run_agent_from_url(url, server_conf=sc, ui_conf=uc)
+                    if not result.get("ok"):
+                        messages = _append_msg(messages, "assistant",
+                                            f"Failed: {result.get('message','unknown error')}")
+                        return messages, [], None
+
+                    items = result.get("items", [])
+                    processed = result.get("images_processed", 0)
+                    brief = json.dumps(items, ensure_ascii=False)[:1200]
+                    reply = (f"Processed {processed} image(s) at server_conf={sc:.2f}, ui_conf={uc:.2f}.\n"
+                            f"Items: {brief}{'...' if len(brief)==1200 else ''}")
+
+                    messages = _append_msg(messages, "assistant", reply)
+                    return messages, imgs, zpath
+
+                except Exception as e:
+                    import traceback; traceback.print_exc()
+                    messages = _append_msg(messages or [], "assistant", f"Unexpected error: {e}")
+                    return messages, [], None
+
 
             chat_btn.click(chat_handler, inputs=[chatbox, chat_msg], outputs=[chatbox, chat_gallery, chat_zip])
 
