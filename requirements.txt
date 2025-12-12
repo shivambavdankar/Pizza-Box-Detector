@@ -8,4 +8,3 @@ gspread
 oauth2client
 pymupdf
 openai
-pyaudioop==0.2.3
