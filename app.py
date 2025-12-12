@@ -611,7 +611,7 @@ with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
         # --- Chat (LLM parses your instruction) ---
         with gr.Tab("Chat"):
             gr.Markdown("Type natural commands like: *run agent at server 0.2 on https://…* (OpenAI if configured; regex fallback otherwise).")
-            chatbox = gr.Chatbot(type="messages", height=320, label="Chat Agent")
+            chatbox = gr.Chatbot(height=320, label="Chat Agent")
             chat_msg = gr.Textbox(placeholder="e.g., run agent ui=0.3 on https://example.com/products", label="Message")
             chat_btn = gr.Button("Send")
             chat_gallery = gr.Gallery(label="Annotated images", columns=2, height=400)
