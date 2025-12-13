@@ -10,6 +10,6 @@ gspread==6.1.2
 google-auth==2.35.0
 google-auth-oauthlib==1.2.1
 openai==1.40.6
-huggingface_hub==0.16.4
+huggingface_hub>=0.19.3
 
 
