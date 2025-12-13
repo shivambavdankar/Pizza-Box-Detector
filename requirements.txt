@@ -4,8 +4,9 @@ requests>=2.32
 Pillow>=10.3
 pandas>=2.2
 python-dotenv>=1.0
-beautifulsoup4
+beautifulsoup4==4.12.3
 gspread
 oauth2client
 pymupdf
 openai
+
