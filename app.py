@@ -1,7 +1,7 @@
 # app.py
 import io, os, time, requests, re
 import pandas as pd
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageOps, ImageFont
 from dotenv import load_dotenv, find_dotenv
 import gradio as gr
 import tempfile
@@ -26,6 +26,7 @@ RF_KEY       = os.getenv("ROBOFLOW_API_KEY", "").strip()
 RF_MODEL     = os.getenv("ROBOFLOW_MODEL", "").strip()
 RF_VERSION   = os.getenv("ROBOFLOW_VERSION", "").strip()
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "none").strip().lower()
+OPENAI_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
 
 print("MODEL:", RF_MODEL)
 print("VERSION:", RF_VERSION)
@@ -49,6 +50,97 @@ def _preprocess_image(pil_img: Image.Image, max_side=1600) -> Image.Image:
         new_w, new_h = int(w/scale), int(h/scale)
         img = img.resize((new_w, new_h))
     return img
+
+# Small graphics helper for category banner
+from PIL import ImageFont, ImageDraw, Image
+
+CATEGORY_COLORS = {
+    "with_pizza": (34, 139, 34, 210),   # green
+    "torn":       (220, 20, 60, 210),   # crimson
+    "good_shape": (30, 144, 255, 210),  # dodger blue
+    "no_box":     (128, 128, 128, 210), # gray
+}
+
+def _load_font(px: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    # Try a common server font; fall back to default
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, max(12, px))
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+def _draw_banner(
+    img: Image.Image,
+    text: str,
+    category: str | None = None,
+    position: str = "bottom",  # "top" or "bottom"
+):
+    """
+    Draws a semi-transparent, rounded pill banner with auto font sizing.
+    """
+    # Work in RGBA for transparency, then convert back to RGB
+    base = img.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    odraw = ImageDraw.Draw(overlay)
+
+    W, H = base.size
+
+    # Auto font size relative to image; clamp to [16, 48]
+    target_px = int(min(W, H) * 0.05)
+    font = _load_font(max(16, min(48, target_px)))
+
+    # Optional emoji for a bit of flair
+    emoji_by_cat = {
+        "with_pizza": "🍕",
+        "torn": "🩹",
+        "good_shape": "✅",
+        "no_box": "❓",
+    }
+    em = emoji_by_cat.get((category or "").lower(), "📦")
+    display_text = f"{em}  {text}"
+
+    # Measure text
+    bbox = odraw.textbbox((0, 0), display_text, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+
+    # Padding & pill geometry
+    pad_x = int(th * 0.8)
+    pad_y = int(th * 0.5)
+    pill_w = tw + pad_x * 2
+    pill_h = th + pad_y * 2
+    radius = pill_h // 2
+
+    # Position centered at top or bottom with margin
+    margin = int(H * 0.02)
+    cx = W // 2
+    if position == "top":
+        y0 = margin
+    else:
+        y0 = H - pill_h - margin
+    x0 = max(0, cx - pill_w // 2)
+    x1 = min(W, x0 + pill_w)
+    y1 = y0 + pill_h
+
+    # Background color w/ alpha
+    bg = CATEGORY_COLORS.get((category or "").lower(), (0, 0, 0, 210))
+    # Draw rounded rectangle
+    odraw.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=bg)
+
+    # Text (centered)
+    tx = x0 + (pill_w - tw) // 2
+    ty = y0 + (pill_h - th) // 2
+    odraw.text((tx, ty), display_text, fill=(255, 255, 255, 255), font=font)
+
+    # Composite back to RGB
+    composed = Image.alpha_composite(base, overlay).convert("RGB")
+    return composed
+
 
 # -------- Roboflow API --------
 def roboflow_detect(pil_image: Image.Image, server_conf: float = 0.15, overlap: float = 0.45):
@@ -238,7 +330,6 @@ def _looks_like_image_url(url: str) -> bool:
     return url.lower().split("?")[0].endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"))
 
 def _download_image_to_pil(url: str, referer: str | None = None) -> Image.Image | None:
-    # skip svg or data URIs
     if url.lower().endswith(".svg") or url.lower().startswith("data:"):
         if DEBUG: print(f"[img] skip non-raster {url}")
         return None
@@ -256,11 +347,6 @@ def _download_image_to_pil(url: str, referer: str | None = None) -> Image.Image 
         return None
 
 def _pick_from_srcset(srcset: str) -> str | None:
-    """
-    Choose the largest candidate. Supports:
-      - width descriptors:  'a.jpg 320w, b.jpg 1024w'
-      - density descriptors: 'a.jpg 1x, b.jpg 2x'
-    """
     best_url, best_score = None, -1.0
     for part in (srcset or "").split(","):
         part = part.strip()
@@ -278,13 +364,11 @@ def _pick_from_srcset(srcset: str) -> str | None:
             if x > best_score:
                 best_url, best_score = u, x
             continue
-        # fallback if no descriptor
         if not best_url:
             best_url = part.split()[0]
     return best_url
 
 def fetch_images_from_webpage(page_url: str, max_images: int = 20) -> list[Image.Image]:
-    # 0) If the input itself is an image URL or serves image/*, download directly
     if _looks_like_image_url(page_url):
         if DEBUG: print("[fetch] direct image URL detected")
         pil = _download_image_to_pil(page_url, referer=None)
@@ -309,7 +393,6 @@ def fetch_images_from_webpage(page_url: str, max_images: int = 20) -> list[Image
     def _abs(u: str) -> str:
         return urljoin(page_url, u)
 
-    # <img> tags
     img_tags = soup.find_all("img")
     if DEBUG: print(f"[parse] found {len(img_tags)} <img> tags on page")
     for tag in img_tags:
@@ -329,7 +412,6 @@ def fetch_images_from_webpage(page_url: str, max_images: int = 20) -> list[Image
             if len(imgs) >= max_images:
                 return imgs
 
-    # <picture><source srcset=...>
     for pic in soup.find_all("picture"):
         for src in pic.find_all("source"):
             cand = _pick_from_srcset(src.get("srcset") or "")
@@ -342,7 +424,6 @@ def fetch_images_from_webpage(page_url: str, max_images: int = 20) -> list[Image
                 if len(imgs) >= max_images:
                     return imgs
 
-    # CSS inline background-image
     for tag in soup.find_all(style=True):
         style = tag.get("style") or ""
         m = re.search(r'background-image\s*:\s*url\((["\']?)(.*?)\1\)', style, flags=re.I)
@@ -355,7 +436,6 @@ def fetch_images_from_webpage(page_url: str, max_images: int = 20) -> list[Image
             if len(imgs) >= max_images:
                 return imgs
 
-    # OpenGraph/Twitter images
     for prop in ("og:image", "twitter:image", "twitter:image:src"):
         meta = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
         if meta and meta.get("content"):
@@ -374,8 +454,6 @@ def _is_gdoc(url: str) -> bool:
 
 def _gdoc_export_pdf(url: str) -> bytes | None:
     try:
-        # edit URL: https://docs.google.com/document/d/FILE_ID/edit
-        # export:   https://docs.google.com/document/d/FILE_ID/export?format=pdf
         parsed = urlparse(url)
         parts = parsed.path.strip("/").split("/")
         file_id = None
@@ -416,6 +494,104 @@ def fetch_images_from_gdoc(url: str, dpi: int = 144) -> list[Image.Image]:
 def load_any_images_from_url(url: str) -> list[Image.Image]:
     return fetch_images_from_gdoc(url) if _is_gdoc(url) else fetch_images_from_webpage(url)
 
+# ========================= Category logic (heuristic + optional LLM refine) =========================
+BOX_KEYWORDS     = ("box", "carton", "container")
+PIZZA_KEYWORDS   = ("pizza",)
+DAMAGED_KEYWORDS = ("torn", "damaged", "crushed", "broken")
+
+def _center(row):
+    cx = row["xmin"] + row["width"]  / 2.0
+    cy = row["ymin"] + row["height"] / 2.0
+    return cx, cy
+
+def _point_in_bbox(px, py, row):
+    return (row["xmin"] <= px <= row["xmax"]) and (row["ymin"] <= py <= row["ymax"])
+
+def _has_keyword(label: str, keywords: tuple[str, ...]) -> bool:
+    s = (label or "").lower()
+    return any(k in s for k in keywords)
+
+def classify_image_heuristic(df: pd.DataFrame) -> tuple[str, str]:
+    """
+    Returns (category, reason)
+    Categories: no_box, with_pizza, torn, good_shape
+    """
+    if df is None or df.empty:
+        return "no_box", "No detections after filtering."
+
+    # any damaged keywords in labels
+    has_damaged = any(_has_keyword(lbl, DAMAGED_KEYWORDS) for lbl in df["label"])
+    # sets
+    boxes  = df[df["label"].str.lower().apply(lambda s: _has_keyword(s, BOX_KEYWORDS))]
+    pizzas = df[df["label"].str.lower().apply(lambda s: _has_keyword(s, PIZZA_KEYWORDS))]
+
+    if not boxes.empty and not pizzas.empty:
+        # if any pizza center lies inside any box -> with_pizza
+        pizza_centers = [ _center(r) for _, r in pizzas.iterrows() ]
+        for _, bx in boxes.iterrows():
+            for (px, py) in pizza_centers:
+                if _point_in_bbox(px, py, bx):
+                    return "with_pizza", "Found a pizza whose center lies inside a detected box."
+        # if both exist but no containment, still likely with_pizza
+        return "with_pizza", "Detected both pizza and box classes."
+
+    if has_damaged:
+        return "torn", "Detected a label that suggests damage (e.g., torn/damaged)."
+
+    if not boxes.empty:
+        return "good_shape", "Detected a box with no signs of damage or visible pizza."
+
+    return "no_box", "Only non-box classes detected."
+
+def classify_image_with_llm(df: pd.DataFrame) -> tuple[str, str]:
+    """
+    Optional classifier using LLM over structured detections.
+    Only called if OPENAI is configured.
+    """
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_KEY)
+
+        schema_hint = {
+            "task": "Decide category for a pizza-related image from detections.",
+            "categories": ["no_box","with_pizza","torn","good_shape"],
+            "rule_of_thumb": [
+                "with_pizza if pizza detection overlaps or co-exists with a box",
+                "torn if any damaged/torn-like label",
+                "good_shape if a box exists without pizza or damage",
+                "no_box if no relevant box detection"
+            ]
+        }
+        table = df.to_dict(orient="records") if df is not None else []
+        prompt = (
+            "You are a precise classifier. Given detections (label, score, x/y/width/height), "
+            "choose exactly one category in {no_box, with_pizza, torn, good_shape} and explain briefly.\n\n"
+            f"Guidelines: {json.dumps(schema_hint, ensure_ascii=False)}\n\n"
+            f"Detections JSON: {json.dumps(table, ensure_ascii=False)}\n\n"
+            "Return JSON only as: {\"category\": \"...\", \"reason\": \"...\"}"
+        )
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0
+        )
+        txt = r.choices[0].message.content.strip()
+        data = json.loads(txt)
+        cat = data.get("category", "")
+        rsn = data.get("reason", "")
+        if cat in {"no_box","with_pizza","torn","good_shape"}:
+            return cat, rsn or "LLM-based classification."
+    except Exception as e:
+        print(f"[LLM classify] fallback due to: {e}")
+    # fallback to heuristic on any failure
+    return classify_image_heuristic(df)
+
+def classify_image(df: pd.DataFrame) -> tuple[str, str]:
+    # Try LLM refine only if configured
+    if LLM_PROVIDER == "openai" and OPENAI_KEY:
+        return classify_image_with_llm(df)
+    return classify_image_heuristic(df)
+
 # ========================= Agent: URL → detection (summary) =========================
 def _zip_files(file_paths: list[str]) -> str | None:
     """Create a zip of given files in temp dir and return its path."""
@@ -454,14 +630,29 @@ def run_agent_from_url(url: str, server_conf: float = 0.15, ui_conf: float = 0.1
             continue
 
         annotated, df, summary, tmp_path = draw_detections(prep, rf_resp, ui_conf=ui_conf)
+
+        # ---- NEW: categorize & banner ----
+        category, reason = classify_image(df)
+        annotated = _draw_banner(
+            annotated,
+            text=f"Category: {category}",
+            category=category,      # <-- enables color mapping & emoji
+            position="bottom"
+        )
+
+
         annotated_pils.append(annotated)
         if tmp_path:
+            # overwrite the saved file with bannered version
+            annotated.save(tmp_path, format="PNG")
             annotated_file_paths.append(tmp_path)
 
         per_item.append({
             "index": idx,
             "status": status,
             "count": int(len(df)),
+            "category": category,
+            "reason": reason,
             "summary": f"{summary} | conf_used={used_conf:.2f}{' (auto-retry)' if retried else ''}"
         })
 
@@ -482,10 +673,10 @@ def _llm_parse_freeform(msg: str) -> dict:
     msg = (msg or "").strip()
     base = {"cmd": "help", "url": _find_url_in_text(msg), "server_conf": None, "ui_conf": None}
 
-    if LLM_PROVIDER == "openai" and os.getenv("OPENAI_API_KEY"):
+    if LLM_PROVIDER == "openai" and OPENAI_KEY:
         try:
             from openai import OpenAI
-            client = OpenAI()
+            client = OpenAI(api_key=OPENAI_KEY)
             prompt = (
                 "Extract a JSON with keys: cmd in {agent, help}, url (string or null), "
                 "server_conf (0..1 or null), ui_conf (0..1 or null) from the user's message. Only return JSON."
@@ -520,6 +711,7 @@ def infer(image: Image.Image, server_conf: float, ui_conf: float):
       1) run detect at server_conf
       2) if zero detections (post UI filter), retry once at server_conf - 0.05
       3) draw results and log every run to CSV
+      4) NEW: classify image & draw banner
     """
     if image is None:
         return None, pd.DataFrame([{"message": "Upload an image."}]), "Total detections: 0", None
@@ -550,9 +742,21 @@ def infer(image: Image.Image, server_conf: float, ui_conf: float):
 
     annotated, df, summary, downloadable = draw_detections(prep, rf_resp, ui_conf=ui_conf)
 
+    # ---- NEW: categorize & banner ----
+    category, reason = classify_image(df)
+    annotated = _draw_banner(
+        annotated,
+        text=f"Category: {category}",
+        category=category,
+        position="bottom"
+    )
+
+    if downloadable:
+        annotated.save(downloadable, format="PNG")
+
     total = len(df)
     per_cls = _per_class_map(df)
-    summary = f"{summary}  |  conf_used={used_conf:.2f}{' (auto-retry)' if retried else ''}"
+    summary = f"**Category: `{category}`**  \n{summary}  |  conf_used={used_conf:.2f}{' (auto-retry)' if retried else ''}"
 
     log_run(
         image_name=getattr(image, "name", None),
@@ -570,7 +774,7 @@ def infer(image: Image.Image, server_conf: float, ui_conf: float):
 
 # -------- UI (tabs) --------
 with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
-    gr.Markdown("## 🍕 Pizza Box Detector — Agentic\nSingle image detection, URL agent, and Chat control.")
+    gr.Markdown("## 🍕 Pizza Box Detector — Agentic\nSingle image detection, URL agent, and Chat control.\nCategories inferred: **no_box**, **with_pizza**, **torn**, **good_shape**.")
 
     with gr.Tabs():
         # --- Single Image tab (original flow) ---
@@ -596,8 +800,8 @@ with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
             a_sc     = gr.Slider(0.0, 1.0, value=0.15, step=0.01, label="Server confidence")
             a_uc     = gr.Slider(0.0, 1.0, value=0.15, step=0.01, label="UI filter")
             run_btn  = gr.Button("Run Agent")
-            url_out  = gr.JSON(label="Agent result")
-            url_gallery = gr.Gallery(label="Annotated images", columns=2, height=400)
+            url_out  = gr.JSON(label="Agent result (now includes category per image)")
+            url_gallery = gr.Gallery(label="Annotated images (banner shows category)", columns=2, height=400)
             url_zip  = gr.File(label="Download all annotated (zip)")
 
             def _run_agent(url, sc, uc):
@@ -608,10 +812,10 @@ with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
 
             run_btn.click(_run_agent, inputs=[url_in, a_sc, a_uc], outputs=[url_out, url_gallery, url_zip])
 
-        # --- Chat (LLM parses your instruction) ---
+        # --- Chat (regex or OpenAI parses your instruction) ---
         with gr.Tab("Chat"):
             gr.Markdown("Type natural commands like: *run agent at server 0.2 on https://…*")
-            chatbox = gr.Chatbot(height=320, label="Chat Agent")  # no type
+            chatbox = gr.Chatbot(height=320, label="Chat Agent")  # tuple mode (compatible on Render)
             chat_msg = gr.Textbox(placeholder="e.g., run agent ui=0.3 on https://example.com/products", label="Message")
             chat_btn = gr.Button("Send")
             chat_gallery = gr.Gallery(label="Annotated images", columns=2, height=400)
@@ -657,7 +861,7 @@ with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
                     processed = result.get("images_processed", 0)
                     brief = json.dumps(items, ensure_ascii=False)[:1200]
                     reply = (f"Processed {processed} image(s) at server_conf={sc:.2f}, ui_conf={uc:.2f}.\n"
-                            f"Items: {brief}{'...' if len(brief)==1200 else ''}")
+                             f"Items: {brief}{'...' if len(brief)==1200 else ''} (each item now has a category.)")
 
                     history[-1] = (user_text, reply)
                     return history, imgs, zpath
@@ -667,14 +871,8 @@ with gr.Blocks(title="Pizza Box Detector — Agentic") as demo:
                     history.append(("", f"Unexpected error: {e}"))
                     return history, [], None
 
-
-
-
             chat_btn.click(chat_handler, inputs=[chatbox, chat_msg], outputs=[chatbox, chat_gallery, chat_zip])
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "7860"))
     demo.queue().launch(server_name="0.0.0.0", server_port=port)
-
-
-

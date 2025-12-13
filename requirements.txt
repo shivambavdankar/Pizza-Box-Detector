@@ -9,7 +9,9 @@ pymupdf==1.24.10
 gspread==6.1.2
 google-auth==2.35.0
 google-auth-oauthlib==1.2.1
-openai==1.40.6
+openai==1.57.0
 huggingface_hub>=0.19.3
-
+langchain>=0.3.7
+langchain-openai>=0.2.6
+langchain-core==0.3.15
 
